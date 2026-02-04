@@ -4,8 +4,17 @@ import random
 import sqlite3
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
-import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+import threading
+import time
+from game_logic import GameLogic
+from keyboards import (
+    owner_main_menu, player_main_menu, get_ai_countries_keyboard,
+    army_upgrade_keyboard, diplomacy_keyboard, alliance_management_keyboard,
+    diplomacy_action_keyboard, alliance_action_keyboard, global_message_keyboard
+)
+from database import get_db_connection
+from config import CHANNEL_ID, OWNER_TELEGRAM_ID
 
 # ========== تنظیمات از Environment Variables ==========
 TOKEN = os.environ.get('BOT_TOKEN', '')
@@ -21,7 +30,8 @@ if not TOKEN:
     exit(1)
 
 # ایجاد ربات
-bot = telebot.TeleBot(TOKEN)
+from telebot import TeleBot
+bot = TeleBot(TOKEN)
 app = Flask(__name__)
 
 # تنظیمات لاگ
@@ -52,6 +62,103 @@ def get_db_connection():
     conn = sqlite3.connect('game.db', check_same_thread=False)
     logger.info("✅ اتصال به SQLite برقرار شد")
     return conn
+
+
+# ========== توابع کمکی =========
+def execute_query(query, params=(), fetchone=False, fetchall=False, commit=False):
+    """تابع کمکی برای اجرای کوئری‌ها"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute(query, params)
+        
+        if commit:
+            conn.commit()
+        
+        if fetchone:
+            result = cursor.fetchone()
+        elif fetchall:
+            result = cursor.fetchall()
+        else:
+            result = None
+        
+        return result
+    except Exception as e:
+        logger.error(f"خطا در اجرای کوئری: {e}")
+        if commit:
+            conn.rollback()
+        raise e
+    finally:
+        conn.close()
+
+
+def calculate_army_power(player_data):
+    """محاسبه قدرت کلی ارتش"""
+    if isinstance(player_data, tuple):
+        # تبدیل tuple به dict
+        player_dict = {
+            'army_infantry': player_data[0],
+            'army_archer': player_data[1],
+            'army_cavalry': player_data[2],
+            'army_spearman': player_data[3],
+            'army_thief': player_data[4]
+        }
+        player_data = player_dict
+    
+    power = (
+        player_data.get('army_infantry', 0) * 1 +
+        player_data.get('army_archer', 0) * 1.5 +
+        player_data.get('army_cavalry', 0) * 2 +
+        player_data.get('army_spearman', 0) * 1.2 +
+        player_data.get('army_thief', 0) * 0.8
+    )
+    return power
+
+
+def calculate_daily_production(user_id):
+    """محاسبه تولید روزانه"""
+    player = execute_query('''
+        SELECT mine_gold_level, mine_iron_level, mine_stone_level,
+               farm_level, barracks_level, country
+        FROM players WHERE user_id = ?
+    ''', (user_id,), fetchone=True)
+    
+    if not player:
+        return None
+    
+    mine_gold, mine_iron, mine_stone, farm, barracks, country = player
+    
+    # تولید پایه
+    production = {
+        'gold': mine_gold * 50,
+        'iron': mine_iron * 30,
+        'stone': mine_stone * 40,
+        'food': farm * 100,
+        'wood': 20
+    }
+    
+    # اعمال بونس کشور
+    if country:
+        country_data = execute_query(
+            'SELECT special_resource FROM countries WHERE name = ?',
+            (country,), fetchone=True
+        )
+        if country_data:
+            resource = country_data[0]
+            bonuses = {
+                'طلا': ('gold', 1.5),
+                'آهن': ('iron', 1.5),
+                'غذا': ('food', 1.5),
+                'سنگ': ('stone', 1.5),
+                'اسب': ('food', 1.3),
+                'دانش': ('gold', 1.2)
+            }
+            if resource in bonuses:
+                resource_type, multiplier = bonuses[resource]
+                production[resource_type] = int(production[resource_type] * multiplier)
+    
+    return production
 
 def init_database():
     """اولیه‌سازی دیتابیس"""
@@ -261,65 +368,48 @@ def calculate_daily_production(user_id):
     
     return production
 
-# ========== منوها ==========
+# ========== منوهای تعاملی =========
+
+
 def main_menu(user_id):
-    """منوی اصلی"""
-    player = execute_query(
-        'SELECT country FROM players WHERE user_id = ?',
-        (user_id,), fetchone=True
-    )
+    """منوی اصلی ربات"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
     
-    has_country = player and player[0]
-    is_owner = user_id == OWNER_ID
+    # Get player info
+    cursor.execute('''
+        SELECT p.country_id, c.name as country_name, a.level as army_level,
+               r.gold, r.iron, r.stone, r.food
+        FROM players p
+        LEFT JOIN countries c ON p.country_id = c.id
+        LEFT JOIN army a ON c.id = a.country_id
+        LEFT JOIN resources r ON c.id = r.country_id
+        WHERE p.telegram_id = ?
+    ''', (user_id,))
     
-    keyboard = InlineKeyboardMarkup()
+    player = cursor.fetchone()
+    conn.close()
+    
+    is_owner = user_id == OWNER_TELEGRAM_ID
     
     if is_owner:
-        # منوی مالک
-        keyboard.row(
-            InlineKeyboardButton("👑 افزودن بازیکن", callback_data="add_player"),
-            InlineKeyboardButton("🌍 کشورها", callback_data="view_countries")
-        )
-        keyboard.row(
-            InlineKeyboardButton("📊 منابع", callback_data="view_resources"),
-            InlineKeyboardButton("⚔️ ارتش", callback_data="army_info")
-        )
-        keyboard.row(
-            InlineKeyboardButton("🤝 دیپلماسی", callback_data="diplomacy"),
-            InlineKeyboardButton("⛏️ معادن", callback_data="mines_farms")
-        )
-        keyboard.row(
-            InlineKeyboardButton("▶️ شروع فصل", callback_data="start_season"),
-            InlineKeyboardButton("⏹️ پایان فصل", callback_data="end_season")
-        )
-        keyboard.row(
-            InlineKeyboardButton("📈 آمار", callback_data="stats"),
-            InlineKeyboardButton("🔄 ریست", callback_data="reset_game")
-        )
-    elif has_country:
-        # منوی بازیکن عادی
-        keyboard.row(
-            InlineKeyboardButton("🏛️ کشور من", callback_data="my_country"),
-            InlineKeyboardButton("📊 منابع", callback_data="view_resources")
-        )
-        keyboard.row(
-            InlineKeyboardButton("⚔️ ارتش", callback_data="army_info"),
-            InlineKeyboardButton("🤝 دیپلماسی", callback_data="diplomacy")
-        )
-        keyboard.row(
-            InlineKeyboardButton("⛏️ معادن", callback_data="mines_farms"),
-            InlineKeyboardButton("🌍 کشورها", callback_data="view_countries")
-        )
+        # Owner menu
+        return owner_main_menu()
+    elif player and player['country_id']:
+        # Player menu with country stats
+        resources = {
+            'gold': player['gold'],
+            'iron': player['iron'], 
+            'stone': player['stone'],
+            'food': player['food']
+        }
+        return player_main_menu(player['country_name'], resources, player['army_level'])
     else:
-        # منوی کاربر بدون کشور
-        keyboard.row(
-            InlineKeyboardButton("🌍 مشاهده کشورها", callback_data="view_countries"),
-            InlineKeyboardButton("📊 وضعیت من", callback_data="view_resources")
-        )
-    
-    keyboard.row(InlineKeyboardButton("ℹ️ راهنما", callback_data="help"))
-    
-    return keyboard
+        # Regular user without assigned country
+        keyboard = InlineKeyboardMarkup()
+        keyboard.add(InlineKeyboardButton("🌍 مشاهده کشورها", callback_data="view_countries"))
+        keyboard.add(InlineKeyboardButton("ℹ️ راهنما", callback_data="help"))
+        return keyboard
 
 def army_menu():
     keyboard = InlineKeyboardMarkup()
